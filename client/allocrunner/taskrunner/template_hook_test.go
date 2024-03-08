@@ -273,22 +273,6 @@ func Test_templateHook_Prestart_Vault(t *testing.T) {
 func Test_templateHook_Prestart_VaultFail(t *testing.T) {
 	ci.Parallel(t)
 
-	// 	secretsResp := `
-	// {
-	//   "data": {
-	//     "data": {
-	//       "secret": "secret"
-	//     },
-	//     "metadata": {
-	//       "created_time": "2023-10-18T15:58:29.65137Z",
-	//       "custom_metadata": null,
-	//       "deletion_time": "",
-	//       "destroyed": false,
-	//       "version": 1
-	//     }
-	//   }
-	// }`
-
 	// Start test server to simulate Vault cluster responses.
 	reqCh := make(chan any)
 	defaultVaultServer := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
@@ -300,6 +284,12 @@ func Test_templateHook_Prestart_VaultFail(t *testing.T) {
 	// Setup client with Vault config.
 	clientConfig := config.DefaultConfig()
 	clientConfig.TemplateConfig.DisableSandbox = true
+	clientConfig.TemplateConfig.VaultRetry = &config.RetryConfig{
+		Attempts:   pointer.Of(2),
+		Backoff:    pointer.Of(200 * time.Millisecond),
+		MaxBackoff: pointer.Of(200 * time.Millisecond),
+	}
+
 	clientConfig.VaultConfigs = map[string]*structsc.VaultConfig{
 		structs.VaultDefaultCluster: {
 			Name:    structs.VaultDefaultCluster,
@@ -313,7 +303,7 @@ func Test_templateHook_Prestart_VaultFail(t *testing.T) {
 		expectErr string
 	}{
 		{
-			name:      "got 403",
+			name:      "exhaust retries on 403",
 			expectErr: "foo",
 		},
 	}
@@ -325,10 +315,12 @@ func Test_templateHook_Prestart_VaultFail(t *testing.T) {
 			alloc := mock.MinAlloc()
 			task := alloc.Job.TaskGroups[0].Tasks[0]
 			taskDir := t.TempDir()
+			taskLifecycleHooks := trtesting.NewMockTaskHooks()
+
 			hookConfig := &templateHookConfig{
 				alloc:        alloc,
 				logger:       testlog.HCLogger(t),
-				lifecycle:    trtesting.NewMockTaskHooks(),
+				lifecycle:    taskLifecycleHooks,
 				events:       &trtesting.MockEmitter{},
 				clientConfig: clientConfig,
 				envBuilder:   taskenv.NewBuilder(mock.Node(), alloc, task, clientConfig.Region),
@@ -349,39 +341,71 @@ func Test_templateHook_Prestart_VaultFail(t *testing.T) {
 				TaskDir: &allocdir.TaskDir{Dir: taskDir},
 			}
 
-			ctx, cancel := context.WithTimeout(context.Background(), 3*time.Second)
-			t.Cleanup(cancel)
+			killCtx, killCancel := context.WithTimeout(context.Background(), 5*time.Second)
+			t.Cleanup(killCancel)
+
+			testCtx, testCancel := context.WithTimeout(context.Background(), time.Second*3)
+			t.Cleanup(testCancel)
+
+			start := time.Now()
 
 			// Start in a goroutine because Prestart() blocks until first
 			// render.
-			hookErrCh := make(chan error)
+			hookErrCh := make(chan error, 1)
 			go func() {
-				err := hook.Prestart(ctx, req, nil)
+				err := hook.Prestart(killCtx, req, nil)
+				t.Logf("%v hook.Prestart done!", time.Now().Sub(start))
 				hookErrCh <- err
 			}()
 
-			var gotRequest bool
+			stopCh := make(chan error, 1)
+
+			killTaskAndStop := func() {
+				killCancel()
+
+				// note: template_hook.Stop doesn't respect context
+				err := hook.Stop(context.TODO(),
+					&interfaces.TaskStopRequest{}, &interfaces.TaskStopResponse{})
+				stopCh <- err
+			}
+
+			var gotRequests int
+			var gotKill bool
+			var gotStop bool
 		LOOP:
 			for {
 				select {
-				// Register mock Vault server received a request.
 				case <-reqCh:
-					gotRequest = true
+					gotRequests++ // record the number of Vault requests we send
 
-				// Verify test doesn't timeout.
-				case <-ctx.Done():
-					must.NoError(t, ctx.Err())
+				case <-taskLifecycleHooks.KillCh:
+					gotKill = true
+					t.Logf("%v KILL recv!", time.Now().Sub(start))
+					go killTaskAndStop() // must be async so we can get Stop hook result
+
+				case err := <-stopCh:
+					t.Logf("%v hook.Stop done!", time.Now().Sub(start))
+					must.NoError(t, err, must.Sprint("expected no error from Stop hook"))
+					gotStop = true
+					break LOOP
+
+				case <-testCtx.Done():
+					t.Logf("%v test timeout!", time.Now().Sub(start))
+					must.NoError(t, testCtx.Err(), must.Sprint("test timed out"))
 					return
 
-				// Verify hook.Prestart() doesn't errors.
 				case err := <-hookErrCh:
-					must.NoError(t, err)
-					break LOOP
+					t.Logf("%v hookErrCh recv!", time.Now().Sub(start))
+					must.NoError(t, err, must.Sprint("expected no error from Prestart hook"))
+
 				}
 			}
 
-			// Verify mock Vault server received a request.
-			must.True(t, gotRequest)
+			t.Logf("%v all done!", time.Now().Sub(start))
+
+			must.True(t, gotStop, must.Sprint("expected stop"))
+			must.True(t, gotKill, must.Sprint("expected kill"))
+			must.Eq(t, 4, gotRequests, must.Sprint("expected requests to use up retries"))
 		})
 	}
 }

@@ -253,8 +253,12 @@ func (tm *TaskTemplateManager) run() {
 	// Start the runner
 	go tm.runner.Start()
 
-	// Block till all the templates have been rendered
-	tm.handleFirstRender()
+	// Block till all the templates have been rendered or until we get an error
+	err := tm.handleFirstRender()
+	if err != nil {
+		//		close(tm.config.UnblockCh)
+		return
+	}
 
 	// Detect if there was a shutdown.
 	select {
@@ -287,7 +291,7 @@ func (tm *TaskTemplateManager) run() {
 }
 
 // handleFirstRender blocks till all templates have been rendered
-func (tm *TaskTemplateManager) handleFirstRender() {
+func (tm *TaskTemplateManager) handleFirstRender() error {
 	// missingDependencies is the set of missing dependencies.
 	var missingDependencies map[string]struct{}
 
@@ -307,16 +311,23 @@ WAIT:
 	for {
 		select {
 		case <-tm.shutdownCh:
-			return
+			return nil
 		case err, ok := <-tm.runner.ErrCh:
 			if !ok {
 				continue
 			}
 
+			// note: we don't return here so that we block on tm.shutdownCh in
+			// the next pass through the loop; this ensures that the caller
+			// doesn't unblock prematurely
 			tm.config.Lifecycle.Kill(context.Background(),
 				structs.NewTaskEvent(structs.TaskKilling).
 					SetFailsTask().
 					SetDisplayMessage(fmt.Sprintf("Template failed: %v", err)))
+
+			// TODO: should we just return an error here instead so that we're not longer polling?
+			//			return err
+
 		case <-tm.runner.TemplateRenderedCh():
 			// A template has been rendered, figure out what to do
 			events := tm.runner.RenderEvents()
@@ -408,6 +419,8 @@ WAIT:
 			tm.config.Events.EmitEvent(structs.NewTaskEvent(consulTemplateSourceName).SetDisplayMessage(fmt.Sprintf("Missing: %s", missingStr)))
 		}
 	}
+
+	return nil
 }
 
 // handleTemplateRerenders is used to handle template render events after they

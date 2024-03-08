@@ -261,8 +261,10 @@ func (h *templateHook) newManager() (unblock chan struct{}, err error) {
 }
 
 func (h *templateHook) Stop(ctx context.Context, req *interfaces.TaskStopRequest, resp *interfaces.TaskStopResponse) error {
+	h.logger.Info("Stop waiting for managerLock")
 	h.managerLock.Lock()
 	defer h.managerLock.Unlock()
+	h.logger.Info("Stop got managerLock")
 
 	// Shutdown any created template
 	if h.templateManager != nil {
