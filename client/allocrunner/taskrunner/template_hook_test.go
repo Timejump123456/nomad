@@ -269,3 +269,119 @@ func Test_templateHook_Prestart_Vault(t *testing.T) {
 		})
 	}
 }
+
+func Test_templateHook_Prestart_VaultFail(t *testing.T) {
+	ci.Parallel(t)
+
+	// 	secretsResp := `
+	// {
+	//   "data": {
+	//     "data": {
+	//       "secret": "secret"
+	//     },
+	//     "metadata": {
+	//       "created_time": "2023-10-18T15:58:29.65137Z",
+	//       "custom_metadata": null,
+	//       "deletion_time": "",
+	//       "destroyed": false,
+	//       "version": 1
+	//     }
+	//   }
+	// }`
+
+	// Start test server to simulate Vault cluster responses.
+	reqCh := make(chan any)
+	defaultVaultServer := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		reqCh <- struct{}{}
+		http.Error(w, "Forbidden", http.StatusForbidden)
+	}))
+	t.Cleanup(defaultVaultServer.Close)
+
+	// Setup client with Vault config.
+	clientConfig := config.DefaultConfig()
+	clientConfig.TemplateConfig.DisableSandbox = true
+	clientConfig.VaultConfigs = map[string]*structsc.VaultConfig{
+		structs.VaultDefaultCluster: {
+			Name:    structs.VaultDefaultCluster,
+			Enabled: pointer.Of(true),
+			Addr:    defaultVaultServer.URL,
+		},
+	}
+
+	testCases := []struct {
+		name      string
+		expectErr string
+	}{
+		{
+			name:      "got 403",
+			expectErr: "foo",
+		},
+	}
+
+	for _, tc := range testCases {
+		t.Run(tc.name, func(t *testing.T) {
+
+			// Setup template hook.
+			alloc := mock.MinAlloc()
+			task := alloc.Job.TaskGroups[0].Tasks[0]
+			taskDir := t.TempDir()
+			hookConfig := &templateHookConfig{
+				alloc:        alloc,
+				logger:       testlog.HCLogger(t),
+				lifecycle:    trtesting.NewMockTaskHooks(),
+				events:       &trtesting.MockEmitter{},
+				clientConfig: clientConfig,
+				envBuilder:   taskenv.NewBuilder(mock.Node(), alloc, task, clientConfig.Region),
+				templates: []*structs.Template{
+					{
+						EmbeddedTmpl: `{{with secret "secret/data/test"}}{{.Data.data.secret}}{{end}}`,
+						ChangeMode:   structs.TemplateChangeModeNoop,
+						DestPath:     path.Join(taskDir, "out.txt"),
+					},
+				},
+			}
+			hook := newTemplateHook(hookConfig)
+
+			// Start template hook with a timeout context to ensure it exists.
+			req := &interfaces.TaskPrestartRequest{
+				Alloc:   alloc,
+				Task:    task,
+				TaskDir: &allocdir.TaskDir{Dir: taskDir},
+			}
+
+			ctx, cancel := context.WithTimeout(context.Background(), 3*time.Second)
+			t.Cleanup(cancel)
+
+			// Start in a goroutine because Prestart() blocks until first
+			// render.
+			hookErrCh := make(chan error)
+			go func() {
+				err := hook.Prestart(ctx, req, nil)
+				hookErrCh <- err
+			}()
+
+			var gotRequest bool
+		LOOP:
+			for {
+				select {
+				// Register mock Vault server received a request.
+				case <-reqCh:
+					gotRequest = true
+
+				// Verify test doesn't timeout.
+				case <-ctx.Done():
+					must.NoError(t, ctx.Err())
+					return
+
+				// Verify hook.Prestart() doesn't errors.
+				case err := <-hookErrCh:
+					must.NoError(t, err)
+					break LOOP
+				}
+			}
+
+			// Verify mock Vault server received a request.
+			must.True(t, gotRequest)
+		})
+	}
+}
